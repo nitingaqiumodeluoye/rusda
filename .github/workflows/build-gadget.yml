@@ -49,17 +49,27 @@ jobs:
           node-version: '22'
 
       # host 依赖也缓存：apt 的 build-essential/ninja/pkg-config 与 pip 的 lief
-      # 每次跑都要重新下载安装，属于「每轮固定开销」。
-      # 分两段缓存：apt 的 .deb 放在 /var/cache/apt/archives，pip 放在
-      # ~/.cache/pip；二者都是纯下载缓存，命中即省网络往返。
-      - name: Cache apt packages
-        uses: actions/cache@v4
+      # 每轮都要重新下载安装，属于固定开销。
+      #
+      # 这里必须用 actions/cache/restore + actions/cache/save 手动配对，不能用
+      # actions/cache@v4 一步到位：后者的保存发生在 post 步骤，而 post 步骤是
+      # success() 门控的 —— 只要本轮失败（调补丁阶段很常见），缓存就永远存不下来，
+      # 下一轮又从零开始。实测四个 run 的 "Post Cache *" 全是 skipped，
+      # NDK 的 747MB 每轮都在重下。
+      #
+      # key 故意用确定性值（不含 run_number）：这样命中时 cache-hit 为 true，
+      # 下面的 save 步骤就能用 cache-hit != 'true' 跳过，避开
+      # "actions/cache/save 遇到已存在 key 会报错"的问题。
+      - name: Restore apt cache
+        id: apt-cache
+        uses: actions/cache/restore@v4
         with:
           path: /var/cache/apt/archives
           key: apt-${{ runner.os }}-${{ env.CACHE_VER }}-${{ hashFiles('.github/workflows/build-gadget.yml') }}
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
+      - name: Restore pip cache
+        id: pip-cache
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/pip
           key: pip-${{ runner.os }}-${{ env.CACHE_VER }}-${{ hashFiles('.github/workflows/build-gadget.yml') }}
@@ -79,15 +89,16 @@ jobs:
           python -c 'import lief; print("lief", lief.__version__)'
           ninja --version
 
-      - name: Cache Android NDK ${{ env.NDK_VERSION }}
+      - name: Restore Android NDK cache
         id: ndk-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/ndk
-          # NDK 是 ~700MB 的固定下载，按版本号+OS 做 key，几乎永远命中。
+          # NDK 是 ~747MB 的固定下载，key 按版本号+OS，确定性 → 命中后 cache-hit 为 true
           key: ndk-${{ env.NDK_VERSION }}-${{ runner.os }}-${{ env.CACHE_VER }}
 
       - name: Download Android NDK ${{ env.NDK_VERSION }}
+        # 确定性 key 命中时 cache-hit 为 true，直接跳过 747MB 下载。
         if: steps.ndk-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -156,16 +167,31 @@ jobs:
       #    会被 checkout 还原掉，所以这里显式用 -e 排除，不依赖忽略规则。
       #  - 补丁新增的未跟踪源文件（lib/base/obfuscate.vala、src/topatch.py）必须
       #    删掉，否则再打补丁会报 "already exists"。
+      # 注意 exclude 模式必须用前置斜杠锚定到仓库根：gitignore 语义下不带斜杠的
+      # 模式会匹配任意层级的同名项。之前写 -e 'build-android-*' 就把补丁新增的
+      # tools/build-android-all.sh 也一起排除在清理之外了，于是再打补丁时报
+      # "already exists in working directory"。
       - name: Reset previous patches
         run: |
           set -euo pipefail
           cd frida
-          git clean -fd -e deps -e 'build-android-*'
+          git clean -fd -e '/deps' -e '/build-android-*'
           git checkout -- .
           git submodule foreach --recursive 'git clean -fd && git checkout -- .'
-          echo "已还原到官方基线"
-          git status --short | head
-          ( cd subprojects/frida-core && git status --short | head )
+
+          # 自检：Reset 没真正把树还原干净的话，后面的 git apply 会报出很难定位的
+          # "already exists"/"does not apply"，不如在这里就直接报出来。
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "FAIL: 主仓库仍有未还原的改动："
+            git status --porcelain | head -20
+            exit 1
+          fi
+          if git submodule foreach --quiet --recursive 'test -z "$(git status --porcelain)"' 2>&1 | grep -v '^Entering' | grep -q .; then
+            echo "FAIL: 子模块仍有未还原的改动"
+            git submodule foreach --recursive 'git status --porcelain | head -5'
+            exit 1
+          fi
+          echo "已确认回到官方基线"
 
       # 按 patches/deliver/README.txt 的顺序打补丁。
       # 注意 superrepo 要 --exclude=releng（releng 是子模块，单独 pin）。
@@ -317,6 +343,32 @@ jobs:
             frida
             dist-arm64
           key: frida-${{ env.FRIDA_TAG }}-${{ env.CACHE_VER }}-${{ runner.os }}-${{ github.run_number }}-${{ github.run_attempt }}-${{ job.status }}
+
+      # 显式保存三个小缓存（apt / pip / NDK），全部跑在 always() 上。
+      # 这是上一版真正的漏洞：它们原本靠 actions/cache@v4 的 post 步骤保存，
+      # 而那是 success() 门控的，于是失败轮次什么都没存下 —— NDK 的 747MB
+      # 每轮重下、host 依赖每轮重装。
+      # cache-hit == 'true' 时跳过（key 已存在，再存会报错）。
+      - name: Save apt cache
+        if: always() && steps.apt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-${{ env.CACHE_VER }}-${{ hashFiles('.github/workflows/build-gadget.yml') }}
+
+      - name: Save pip cache
+        if: always() && steps.pip-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ env.CACHE_VER }}-${{ hashFiles('.github/workflows/build-gadget.yml') }}
+
+      - name: Save Android NDK cache
+        if: always() && steps.ndk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ndk
+          key: ndk-${{ env.NDK_VERSION }}-${{ runner.os }}-${{ env.CACHE_VER }}
 
       # 构建失败时把 meson 日志捞出来，省一次往返。
       - name: Collect logs on failure
