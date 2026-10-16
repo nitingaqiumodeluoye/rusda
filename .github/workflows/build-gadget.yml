@@ -9,6 +9,11 @@ name: build-gadget
 # 迭代快得多。正式发包仍走 build-android-all.sh。
 on:
   workflow_dispatch:
+    inputs:
+      clean:
+        description: '忽略缓存，从零构建（缓存疑似损坏时用）'
+        type: boolean
+        default: false
   push:
     paths:
       - '17.15.0/patches/deliver/frida-core-gadget-custom-linker.patch'
@@ -17,6 +22,8 @@ on:
 env:
   FRIDA_TAG: '17.15.0'
   FRIDA_REPO: 'https://github.com/frida/frida'
+  # 缓存版本号：改它可强制作废所有 frida 缓存（补丁/流程大改时用）。
+  CACHE_VER: 'v1'
   # frida 的 releng/env_android.py 里有 NDK_REQUIRED = 29，主版本不符会直接
   # 在 configure 阶段报 "NDK r29 is required"。所以这里必须钉死 r29。
   NDK_VERSION: 'r29'
@@ -51,7 +58,7 @@ jobs:
           pip install --upgrade pip
           pip install lief
 
-      - name: Cache Android NDK r29
+      - name: Cache Android NDK ${{ env.NDK_VERSION }}
         id: ndk-cache
         uses: actions/cache@v4
         with:
@@ -68,7 +75,6 @@ jobs:
           curl -fL -o ndk.zip "https://dl.google.com/android/repository/$NDK_ZIP"
           unzip -q ndk.zip
           rm -f ndk.zip
-          ls -d "$RUNNER_TEMP"/ndk/android-ndk-*
 
       - name: Locate NDK
         id: ndk
@@ -78,15 +84,64 @@ jobs:
           test -n "$NDK_ROOT" || { echo "找不到解压后的 NDK 目录"; exit 1; }
           echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_OUTPUT"
           echo "使用 NDK: $NDK_ROOT"
-          cat "$NDK_ROOT/source.properties" || true
 
-      - name: Clone frida ${{ env.FRIDA_TAG }}
+      # ── 缓存 frida 整棵树（源码 + 子模块 + deps/ + build 目录）────────────
+      # 一次缓存同时解决三笔开销：
+      #   1) clone --recurse-submodules（frida 仓库很大）
+      #   2) configure（它要下载/构建 deps/：host 工具链 + 目标 SDK）
+      #   3) 全量编译（build 目录命中后可走 ninja 增量）
+      #
+      # key 里带 run_number + restore-keys 前缀，是标准的「滚动缓存」写法：
+      # 每次跑都从最近一次缓存恢复，跑完再存一份新的（actions/cache 只在
+      # post 步骤保存）。cache-hit 只在 key 精确命中时为 true，命中 restore-keys
+      # 的旧缓存时是 false，但内容已经恢复 —— 所以下面 clone 步骤还要再判一次
+      # 目录是否存在，不能只看 cache-hit。
+      - name: Restore frida cache
+        if: inputs.clean != true
+        id: frida-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            frida
+            dist-arm64
+          key: frida-${{ env.FRIDA_TAG }}-${{ env.CACHE_VER }}-${{ runner.os }}-${{ github.run_number }}
+          restore-keys: |
+            frida-${{ env.FRIDA_TAG }}-${{ env.CACHE_VER }}-${{ runner.os }}-
+
+      - name: Clone frida ${{ env.FRIDA_TAG }} (cache miss)
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
+          if [ -d frida/.git ]; then
+            echo "frida 目录已从缓存恢复，跳过 clone"
+            cd frida
+            echo "当前基线: $(git describe --tags --always 2>/dev/null || echo unknown)"
+            exit 0
+          fi
           git clone --recurse-submodules -b "$FRIDA_TAG" "$FRIDA_REPO" frida
           cd frida
+          echo "子模块状态:"
           git submodule status | head -20
+
+      # 缓存里那棵树是「上一轮已经打过补丁」的状态，直接再打一次会冲突。
+      # 所以先把它还原成官方基线，再干净地打本轮补丁。
+      #
+      # 注意两点：
+      #  - deps/ 与 build-android-*/ 必须保留，否则缓存就白做了。
+      #    它们虽然已被 .gitignore 忽略（frida 自带忽略 /deps/，rusda 的
+      #    superrepo 补丁追加 /build-android-*/），但那个 .gitignore 改动本身
+      #    会被 checkout 还原掉，所以这里显式用 -e 排除，不依赖忽略规则。
+      #  - 补丁新增的未跟踪源文件（lib/base/obfuscate.vala、src/topatch.py）必须
+      #    删掉，否则再打补丁会报 "already exists"。
+      - name: Reset previous patches
+        run: |
+          set -euo pipefail
+          cd frida
+          git clean -fd -e deps -e 'build-android-*'
+          git checkout -- .
+          git submodule foreach --recursive 'git clean -fd && git checkout -- .'
+          echo "已还原到官方基线"
+          git status --short | head
+          ( cd subprojects/frida-core && git status --short | head )
 
       # 按 patches/deliver/README.txt 的顺序打补丁。
       # 注意 superrepo 要 --exclude=releng（releng 是子模块，单独 pin）。
@@ -111,19 +166,29 @@ jobs:
           echo "=== 确认关键改动确实落到了源码里 ==="
           grep -q "detect_location_from_ranges" subprojects/frida-core/lib/gadget/gadget.vala \
             || { echo "FAIL: gadget.vala 里没有 detect_location_from_ranges，补丁没生效"; exit 1; }
-          grep -q "assert (our_range != null)" subprojects/frida-core/lib/gadget/gadget.vala \
-            && { echo "FAIL: 断言还在，补丁没替换掉它"; exit 1; } \
-            || echo "OK: 断言已移除，回退逻辑已就位"
+          if grep -q "assert (our_range != null)" subprojects/frida-core/lib/gadget/gadget.vala; then
+            echo "FAIL: 断言还在，补丁没替换掉它"; exit 1
+          fi
+          echo "OK: 断言已移除，回退逻辑已就位"
 
       # 只编 gadget、只编 arm64：够验证这条线，且比四架构全量快得多。
       # QuickJS 是 frida 默认运行时（frida-gum 的 meson.options 里 quickjs=enabled），
       # 不碰 V8，所以不需要额外的 V8 依赖。
+      #
+      # build 目录命中缓存时这里必须跳过 configure：frida 的 meson_configure.py
+      # 遇到已有 build.ninja 是 sys.exit(1)（"Already configured. Wipe ... to
+      # reconfigure."），不是无害的 no-op。跳过它、直接 make，就能拿到 ninja 的
+      # 增量构建（meson 自己会在 meson.build 变化时重新生成 build.ninja）。
       - name: Configure (android-arm64, gadget only)
         env:
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.NDK_ROOT }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/frida"
+          if [ -f build-android-arm64/build.ninja ]; then
+            echo "build 目录已从缓存复用，跳过 configure，直接增量构建"
+            exit 0
+          fi
           mkdir -p build-android-arm64
           cd build-android-arm64
           ../configure \
@@ -147,21 +212,27 @@ jobs:
           cd "$GITHUB_WORKSPACE/frida/build-android-arm64"
           make install
 
-      # 两条独立校验：
+      # 三条独立校验：
       #  a) 架构必须是 arm64（历史上出现过把 32 位「模拟」gadget 误当 arm64 打包）；
       #  b) 我加的 log_warning 文案必须在二进制里 —— 这是「补丁真的进了产物」的
-      #     直接证据，比只看源码能不能打上补丁强。
+      #     直接证据，比只看源码能不能打上补丁强；
+      #  c) 断言文案不应再出现（它被换掉了）。
       - name: Verify artifact
         id: verify
         run: |
           set -euo pipefail
           DIST="$GITHUB_WORKSPACE/dist-arm64"
           echo "=== dist 树 ==="
-          find "$DIST" -name '*gadget*.so' -o -name '*gadget*' | head -20
+          find "$DIST" -name '*gadget*' | head -20
 
           # 新版 frida 把 gadget 放在 lib/rusda-<api>/{32,64}/，老版在 lib/rusda/{32,64}/
           GADGET="$(find "$DIST/lib" -path '*/64/rusda-gadget.so' 2>/dev/null | head -1)"
-          test -n "$GADGET" || GADGET="$(find "$DIST/lib" -name 'rusda-gadget.so' -o -name 'libgadget.so' | head -1)"
+          if [ -z "$GADGET" ]; then
+            GADGET="$(find "$DIST/lib" -name 'rusda-gadget.so' | head -1)"
+          fi
+          if [ -z "$GADGET" ]; then
+            GADGET="$(find "$DIST" -name '*gadget*.so' | head -1)"
+          fi
           test -n "$GADGET" || { echo "FAIL: 没找到 gadget 产物"; find "$DIST" | head -50; exit 1; }
           echo "gadget: $GADGET"
 
@@ -170,7 +241,7 @@ jobs:
           readelf -h "$GADGET" | grep -q 'AArch64' \
             || { echo "FAIL: 产物不是 AArch64"; exit 1; }
 
-          echo "=== 补丁痕迹校验（应有 custom linker 告警文案）==="
+          echo "=== 补丁痕迹校验 ==="
           if strings -a "$GADGET" | grep -q "custom linker"; then
             echo "OK: 找到补丁注入的告警文案，补丁确实进了产物"
           else

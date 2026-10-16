@@ -1,8 +1,8 @@
 diff --git a/lib/gadget/gadget.vala b/lib/gadget/gadget.vala
 index 230284c..0000000 100644
---- a/lib/gadget/gadget.vala
-+++ b/lib/gadget/gadget.vala
-@@ -718,34 +718,71 @@
+--- orig_gadget.vala	2026-10-16 11:36:32.771700400 +0800
++++ gadget.vala	2026-10-16 11:55:52.594070900 +0800
+@@ -718,34 +718,80 @@
  #if DARWIN
  		Environment.detect_darwin_location_fields (our_address, ref executable_name, ref our_path, ref our_range);
  #else
@@ -59,23 +59,32 @@ index 230284c..0000000 100644
 +	 *
 +	 * 顺带把 our_path 也找出来 —— 它是 Gadget 定位自身 .config 文件的关键：自定义
 +	 * 加载器写下的容器路径会出现在 maps 里，据此推导出的 <stem>.config.so 与预置的
-+	 * 暂存配置路径正好吻合。 */
++	 * 暂存配置路径正好吻合。
++	 *
++	 * 注意：Vala 不允许在闭包里捕获 ref/out 参数（会报 "Cannot capture reference
++	 * or output parameter"），所以这里先用局部变量收集，枚举结束后再写回 ref 参数。 */
 +	private void detect_location_from_ranges (Gum.Address our_address, ref string? our_path, ref Gum.MemoryRange? our_range) {
++		string? found_path = null;
++		Gum.MemoryRange? found_range = null;
++
 +		Gum.Process.enumerate_ranges (Gum.PageProtection.READ, (details) => {
 +			var range = details.range;
 +			if (our_address < range.base_address || our_address >= range.base_address + range.size)
 +				return true;
 +
-+			our_range = range;
++			found_range = range;
 +
-+			if (our_path == null) {
++			if (found_path == null) {
 +				var file = details.file;
 +				if (file != null)
-+					our_path = file.path;
++					found_path = file.path;
 +			}
 +
 +			return false;
 +		});
++
++		our_range = found_range;
++		our_path = found_path;
 +	}
 +
  	private interface Controller : Object {
