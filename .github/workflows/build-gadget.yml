@@ -188,12 +188,21 @@ jobs:
           ( cd subprojects/frida-gum && git apply "$RUSDA/17.15.0/patches/deliver/frida-gum.patch" )
 
           echo "=== 确认关键改动确实落到了源码里 ==="
-          grep -q "detect_location_from_ranges" subprojects/frida-core/lib/gadget/gadget.vala \
-            || { echo "FAIL: gadget.vala 里没有 detect_location_from_ranges，补丁没生效"; exit 1; }
+          # 注意：这里校验的是补丁里那个回退函数的实际名字，改名时此处要同步，
+          # 否则会变成「补丁明明打了、却被自己的校验判成失败」。
+          grep -q "detect_location_from_maps" subprojects/frida-core/lib/gadget/gadget.vala \
+            || { echo "FAIL: gadget.vala 里没有 detect_location_from_maps，补丁没生效"; exit 1; }
           if grep -q "assert (our_range != null)" subprojects/frida-core/lib/gadget/gadget.vala; then
             echo "FAIL: 断言还在，补丁没替换掉它"; exit 1
           fi
-          echo "OK: 断言已移除，回退逻辑已就位"
+          # 确认已不再使用 Gum.FileMapping（它的结构体拷贝会在 C 层因缺少
+          # gum_file_mapping_copy/destroy 而报 undeclared function）。
+          # 只看代码，忽略注释（注释里会提到这个名字解释为何不用它）。
+          if grep -vE '^\s*\*|^\s*/\*' subprojects/frida-core/lib/gadget/gadget.vala \
+               | grep -qE 'Gum\.FileMapping|details\.file'; then
+            echo "FAIL: 代码里仍在使用 Gum.FileMapping/details.file"; exit 1
+          fi
+          echo "OK: 断言已移除，回退逻辑已就位，且已不再依赖 Gum.FileMapping"
 
       # 只编 gadget、只编 arm64：够验证这条线，且比四架构全量快得多。
       # QuickJS 是 frida 默认运行时（frida-gum 的 meson.options 里 quickjs=enabled），
