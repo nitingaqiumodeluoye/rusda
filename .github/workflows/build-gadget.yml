@@ -1,0 +1,210 @@
+name: build-gadget
+
+# 只为「自定义链接器加载」这条线出包：编一个 arm64 的 rusda-gadget，
+# 用来验证 frida-core-gadget-custom-linker.patch 是否让 Gadget 能被 CSOLoader
+# 这类「不进 soinfo」的加载器拉起。
+#
+# 为什么单独一个 workflow 而不是塞进 build-android-all.sh：
+# 那个脚本编四架构 × (server+gadget+inject)，一次要很久；这里只编 arm64 gadget，
+# 迭代快得多。正式发包仍走 build-android-all.sh。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '17.15.0/patches/deliver/frida-core-gadget-custom-linker.patch'
+      - '.github/workflows/build-gadget.yml'
+
+env:
+  FRIDA_TAG: '17.15.0'
+  FRIDA_REPO: 'https://github.com/frida/frida'
+  # frida 的 releng/env_android.py 里有 NDK_REQUIRED = 29，主版本不符会直接
+  # 在 configure 阶段报 "NDK r29 is required"。所以这里必须钉死 r29。
+  NDK_VERSION: 'r29'
+  NDK_ZIP: 'android-ndk-r29-linux.zip'
+
+jobs:
+  build-gadget-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout rusda (patches)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # frida 的构建链要 Node（生成 JS 侧资源 / 内嵌 agent）。
+      # rusda README 记录的编译环境是 Node 22。
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install host deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config xz-utils git
+          # lief 用于 tools/post-process.py 里的二进制改写（topatch）。
+          # 不装它，链接后处理会失败。
+          pip install --upgrade pip
+          pip install lief
+
+      - name: Cache Android NDK r29
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ndk
+          key: ndk-${{ env.NDK_VERSION }}-linux
+
+      - name: Download Android NDK ${{ env.NDK_VERSION }}
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ndk"
+          cd "$RUNNER_TEMP/ndk"
+          echo "下载 $NDK_ZIP ..."
+          curl -fL -o ndk.zip "https://dl.google.com/android/repository/$NDK_ZIP"
+          unzip -q ndk.zip
+          rm -f ndk.zip
+          ls -d "$RUNNER_TEMP"/ndk/android-ndk-*
+
+      - name: Locate NDK
+        id: ndk
+        run: |
+          set -euo pipefail
+          NDK_ROOT="$(find "$RUNNER_TEMP/ndk" -maxdepth 1 -type d -name 'android-ndk-*' | head -1)"
+          test -n "$NDK_ROOT" || { echo "找不到解压后的 NDK 目录"; exit 1; }
+          echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_OUTPUT"
+          echo "使用 NDK: $NDK_ROOT"
+          cat "$NDK_ROOT/source.properties" || true
+
+      - name: Clone frida ${{ env.FRIDA_TAG }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git clone --recurse-submodules -b "$FRIDA_TAG" "$FRIDA_REPO" frida
+          cd frida
+          git submodule status | head -20
+
+      # 按 patches/deliver/README.txt 的顺序打补丁。
+      # 注意 superrepo 要 --exclude=releng（releng 是子模块，单独 pin）。
+      - name: Apply patches
+        run: |
+          set -euo pipefail
+          RUSDA="$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE/frida"
+
+          echo "=== [1] superrepo.patch ==="
+          git apply --exclude=releng "$RUSDA/17.15.0/patches/deliver/superrepo.patch"
+
+          echo "=== [2] frida-core.patch ==="
+          ( cd subprojects/frida-core && git apply "$RUSDA/17.15.0/patches/deliver/frida-core.patch" )
+
+          echo "=== [3] frida-core-gadget-custom-linker.patch ==="
+          ( cd subprojects/frida-core && git apply "$RUSDA/17.15.0/patches/deliver/frida-core-gadget-custom-linker.patch" )
+
+          echo "=== [4] frida-gum.patch ==="
+          ( cd subprojects/frida-gum && git apply "$RUSDA/17.15.0/patches/deliver/frida-gum.patch" )
+
+          echo "=== 确认关键改动确实落到了源码里 ==="
+          grep -q "detect_location_from_ranges" subprojects/frida-core/lib/gadget/gadget.vala \
+            || { echo "FAIL: gadget.vala 里没有 detect_location_from_ranges，补丁没生效"; exit 1; }
+          grep -q "assert (our_range != null)" subprojects/frida-core/lib/gadget/gadget.vala \
+            && { echo "FAIL: 断言还在，补丁没替换掉它"; exit 1; } \
+            || echo "OK: 断言已移除，回退逻辑已就位"
+
+      # 只编 gadget、只编 arm64：够验证这条线，且比四架构全量快得多。
+      # QuickJS 是 frida 默认运行时（frida-gum 的 meson.options 里 quickjs=enabled），
+      # 不碰 V8，所以不需要额外的 V8 依赖。
+      - name: Configure (android-arm64, gadget only)
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.NDK_ROOT }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/frida"
+          mkdir -p build-android-arm64
+          cd build-android-arm64
+          ../configure \
+            --prefix="$GITHUB_WORKSPACE/dist-arm64" \
+            --host=android-arm64 \
+            --enable-gadget
+
+      - name: Build
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.NDK_ROOT }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/frida/build-android-arm64"
+          make -j"$(nproc)"
+
+      - name: Install
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.NDK_ROOT }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/frida/build-android-arm64"
+          make install
+
+      # 两条独立校验：
+      #  a) 架构必须是 arm64（历史上出现过把 32 位「模拟」gadget 误当 arm64 打包）；
+      #  b) 我加的 log_warning 文案必须在二进制里 —— 这是「补丁真的进了产物」的
+      #     直接证据，比只看源码能不能打上补丁强。
+      - name: Verify artifact
+        id: verify
+        run: |
+          set -euo pipefail
+          DIST="$GITHUB_WORKSPACE/dist-arm64"
+          echo "=== dist 树 ==="
+          find "$DIST" -name '*gadget*.so' -o -name '*gadget*' | head -20
+
+          # 新版 frida 把 gadget 放在 lib/rusda-<api>/{32,64}/，老版在 lib/rusda/{32,64}/
+          GADGET="$(find "$DIST/lib" -path '*/64/rusda-gadget.so' 2>/dev/null | head -1)"
+          test -n "$GADGET" || GADGET="$(find "$DIST/lib" -name 'rusda-gadget.so' -o -name 'libgadget.so' | head -1)"
+          test -n "$GADGET" || { echo "FAIL: 没找到 gadget 产物"; find "$DIST" | head -50; exit 1; }
+          echo "gadget: $GADGET"
+
+          echo "=== 架构校验 ==="
+          readelf -h "$GADGET" | sed -n 's/.*Machine:[[:space:]]*//p'
+          readelf -h "$GADGET" | grep -q 'AArch64' \
+            || { echo "FAIL: 产物不是 AArch64"; exit 1; }
+
+          echo "=== 补丁痕迹校验（应有 custom linker 告警文案）==="
+          if strings -a "$GADGET" | grep -q "custom linker"; then
+            echo "OK: 找到补丁注入的告警文案，补丁确实进了产物"
+          else
+            echo "FAIL: 产物里没有补丁注入的文案 —— 补丁没进二进制"
+            exit 1
+          fi
+
+          echo "=== 确认不再是官方 gadget（SONAME）==="
+          readelf -d "$GADGET" | grep -E 'SONAME' || true
+
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$GADGET" "$GITHUB_WORKSPACE/out/rusda-gadget-17.15.0-android-arm64.so"
+          xz -T0 -c "$GITHUB_WORKSPACE/out/rusda-gadget-17.15.0-android-arm64.so" \
+            > "$GITHUB_WORKSPACE/out/rusda-gadget-17.15.0-android-arm64.so.xz"
+          ls -lh "$GITHUB_WORKSPACE/out/"
+          echo "GADGET_PATH=$GADGET" >> "$GITHUB_OUTPUT"
+
+      - name: Upload gadget
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusda-gadget-17.15.0-arm64-${{ github.run_number }}
+          path: |
+            out/rusda-gadget-17.15.0-android-arm64.so
+            out/rusda-gadget-17.15.0-android-arm64.so.xz
+          retention-days: 30
+
+      # 构建失败时把 meson 日志捞出来，省一次往返。
+      - name: Collect logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            frida/build-android-arm64/meson-logs/
+            frida/build-android-*/meson-logs/
+          if-no-files-found: ignore
+          retention-days: 7

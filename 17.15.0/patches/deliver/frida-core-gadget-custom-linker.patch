@@ -1,0 +1,83 @@
+diff --git a/lib/gadget/gadget.vala b/lib/gadget/gadget.vala
+index 230284c..0000000 100644
+--- a/lib/gadget/gadget.vala
++++ b/lib/gadget/gadget.vala
+@@ -718,34 +718,71 @@
+ #if DARWIN
+ 		Environment.detect_darwin_location_fields (our_address, ref executable_name, ref our_path, ref our_range);
+ #else
+-		var index = 0;
+ 		Gum.Process.enumerate_modules ((details) => {
+-			var range = details.range;
+-
+-			if (index == 0) {
++			if (executable_name == null) {
+ 				executable_name = details.name;
+ 			}
+ 
+ 			if (mapped_range != null)
+ 				return false;
+ 
++			var range = details.range;
+ 			if (our_address >= range.base_address && our_address < range.base_address + range.size) {
+ 				our_path = details.path;
+ 				our_range = range;
+ 				return false;
+ 			}
+ 
+-			index++;
+-
+ 			return true;
+ 		});
++
++		if (our_range == null) {
++			detect_location_from_ranges (our_address, ref our_path, ref our_range);
++		}
+ #endif
+ 
+-		assert (our_range != null);
++		if (our_range == null) {
++			log_warning ("Unable to determine our own module; Gadget was loaded by a custom linker?");
++
++			var fallback = Gum.MemoryRange ();
++			fallback.base_address = our_address;
++			fallback.size = 1;
++			our_range = fallback;
++		}
++
++		if (executable_name == null) {
++			executable_name = our_path ?? "gadget";
++		}
+ 
+ 		return new Location (executable_name, our_path, our_range);
+ 	}
+ 
++	/* 自定义链接器加载本模块时（例如把 .so 直接 mmap 进内存、不注册进系统 soinfo
++	 * 链表的加载器），Gum.Process.enumerate_modules() 看不到我们，our_range 会是
++	 * null，从而触发上面 detect_location 的断言。这里回退到
++	 * Gum.Process.enumerate_ranges()：它读 /proc/self/maps，不依赖 soinfo。
++	 *
++	 * 顺带把 our_path 也找出来 —— 它是 Gadget 定位自身 .config 文件的关键：自定义
++	 * 加载器写下的容器路径会出现在 maps 里，据此推导出的 <stem>.config.so 与预置的
++	 * 暂存配置路径正好吻合。 */
++	private void detect_location_from_ranges (Gum.Address our_address, ref string? our_path, ref Gum.MemoryRange? our_range) {
++		Gum.Process.enumerate_ranges (Gum.PageProtection.READ, (details) => {
++			var range = details.range;
++			if (our_address < range.base_address || our_address >= range.base_address + range.size)
++				return true;
++
++			our_range = range;
++
++			if (our_path == null) {
++				var file = details.file;
++				if (file != null)
++					our_path = file.path;
++			}
++
++			return false;
++		});
++	}
++
+ 	private interface Controller : Object {
+ 		public abstract bool is_eternal {
+ 			get;

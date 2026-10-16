@@ -55,6 +55,7 @@ rusda 分三层把这些尽量抹掉，同时不动 frida 的功能、也不破�
 | memfd 名 → `jit-cache` | `lib/base/linux.vala`（17.6.2）、`frida-helper-backend.vala`（16.x / 16.7） | 避免 `maps` 里露出 `memfd:frida-agent` |
 | `frida_agent_main` → `main`（iOS 为 `rusda_agent_main`） | 各 `*-host-session.vala`、`agent-container.vala` | 符号 / 入口检测 |
 | `g_set_prgname("frida")` → `"russell"` | `gum/gum.c`、`src/frida-glue.c` | 进程名 |
+| gadget 自身定位不再只能靠 soinfo，可回退 `/proc/self/maps` | `lib/gadget/gadget.vala` | 让 Gadget 能被「不进 soinfo」的自定义链接器（如 CSOLoader）加载，否则构造函数里的 `assert (our_range != null)` 直接 abort。详见 `17.15.0/patches/deliver/README.txt` |
 
 能在源码解决的就在源码解决；像线程名、rpc 这种改成运行时拼，二进制里压根不出现明文。
 
