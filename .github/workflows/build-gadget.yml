@@ -48,22 +48,44 @@ jobs:
         with:
           node-version: '22'
 
+      # host 依赖也缓存：apt 的 build-essential/ninja/pkg-config 与 pip 的 lief
+      # 每次跑都要重新下载安装，属于「每轮固定开销」。
+      # 分两段缓存：apt 的 .deb 放在 /var/cache/apt/archives，pip 放在
+      # ~/.cache/pip；二者都是纯下载缓存，命中即省网络往返。
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-${{ env.CACHE_VER }}-${{ hashFiles('.github/workflows/build-gadget.yml') }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ env.CACHE_VER }}-${{ hashFiles('.github/workflows/build-gadget.yml') }}
+
       - name: Install host deps
         run: |
           sudo apt-get update
+          # --no-install-recommends：不装推荐包，减少下载量；
+          # apt 会命中上面缓存的 .deb，省掉重复下载。
           sudo apt-get install -y --no-install-recommends \
             build-essential ninja-build pkg-config xz-utils git
           # lief 用于 tools/post-process.py 里的二进制改写（topatch）。
           # 不装它，链接后处理会失败。
           pip install --upgrade pip
           pip install lief
+          # 确认真的可用（缓存坏掉时尽早暴露）
+          python -c 'import lief; print("lief", lief.__version__)'
+          ninja --version
 
       - name: Cache Android NDK ${{ env.NDK_VERSION }}
         id: ndk-cache
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/ndk
-          key: ndk-${{ env.NDK_VERSION }}-linux
+          # NDK 是 ~700MB 的固定下载，按版本号+OS 做 key，几乎永远命中。
+          key: ndk-${{ env.NDK_VERSION }}-${{ runner.os }}-${{ env.CACHE_VER }}
 
       - name: Download Android NDK ${{ env.NDK_VERSION }}
         if: steps.ndk-cache.outputs.cache-hit != 'true'
@@ -76,35 +98,37 @@ jobs:
           unzip -q ndk.zip
           rm -f ndk.zip
 
+      # NDK 解压目录：上面 cache 命中时它已经在 runner.temp/ndk 下了。
+      # 注意 NDK 的 cache key 不含 run_number，所以命中时 cache-hit 为 true，
+      # 下载步骤会被跳过；这里只需把路径找出来。
       - name: Locate NDK
         id: ndk
         run: |
           set -euo pipefail
           NDK_ROOT="$(find "$RUNNER_TEMP/ndk" -maxdepth 1 -type d -name 'android-ndk-*' | head -1)"
-          test -n "$NDK_ROOT" || { echo "找不到解压后的 NDK 目录"; exit 1; }
+          if [ -z "$NDK_ROOT" ]; then
+            echo "缓存与下载都没能提供 NDK（缓存可能损坏），请用 clean 选项重跑"
+            ls -la "$RUNNER_TEMP/ndk" || true
+            exit 1
+          fi
           echo "NDK_ROOT=$NDK_ROOT" >> "$GITHUB_OUTPUT"
           echo "使用 NDK: $NDK_ROOT"
+          grep -E 'Pkg\.Revision|Pkg\.Desc' "$NDK_ROOT/source.properties" || true
 
-      # ── 缓存 frida 整棵树（源码 + 子模块 + deps/ + build 目录）────────────
-      # 一次缓存同时解决三笔开销：
-      #   1) clone --recurse-submodules（frida 仓库很大）
-      #   2) configure（它要下载/构建 deps/：host 工具链 + 目标 SDK）
-      #   3) 全量编译（build 目录命中后可走 ninja 增量）
-      #
-      # key 里带 run_number + restore-keys 前缀，是标准的「滚动缓存」写法：
-      # 每次跑都从最近一次缓存恢复，跑完再存一份新的（actions/cache 只在
-      # post 步骤保存）。cache-hit 只在 key 精确命中时为 true，命中 restore-keys
-      # 的旧缓存时是 false，但内容已经恢复 —— 所以下面 clone 步骤还要再判一次
-      # 目录是否存在，不能只看 cache-hit。
+      # 失败也要把缓存存下来：frida 的全量构建很久，若只在成功时保存，
+      # 一旦后面某步失败（比如补丁/编译报错），cloned 源码 + deps/ + 已编译的
+      # 那部分 build 目录就全白费，下一轮又从零开始。这里显式 restore/save，
+      # 并用 always() 保证失败路径也走到保存。
+      # 注意 actions/cache 的 post 步骤是 success() 门控的，所以不能只靠它。
       - name: Restore frida cache
         if: inputs.clean != true
         id: frida-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             frida
             dist-arm64
-          key: frida-${{ env.FRIDA_TAG }}-${{ env.CACHE_VER }}-${{ runner.os }}-${{ github.run_number }}
+          key: frida-${{ env.FRIDA_TAG }}-${{ env.CACHE_VER }}-${{ runner.os }}-${{ github.run_number }}-${{ github.run_attempt }}
           restore-keys: |
             frida-${{ env.FRIDA_TAG }}-${{ env.CACHE_VER }}-${{ runner.os }}-
 
@@ -267,6 +291,23 @@ jobs:
             out/rusda-gadget-17.15.0-android-arm64.so
             out/rusda-gadget-17.15.0-android-arm64.so.xz
           retention-days: 30
+
+      # 显式保存缓存，跑在 always() 上 —— 失败也要存。
+      # 这是本 workflow 能快速迭代的关键：即使这一轮因为补丁写错而在 valac 或
+      # 链接阶段失败，frida 源码 + deps/ + 已编译产物也会留下来，下一轮直接从
+      # 失败点附近继续，而不是重新 clone + configure + 全量编译。
+      # 失败时用 -failed 后缀做 key，避免污染成功路径的缓存；restore-keys 前缀
+      # 相同，所以下轮仍能恢复到它。
+      # 带 run_attempt 是因为重跑（re-run）会沿用同一个 run_number，而
+      # actions/cache/save 遇到已存在的 key 会直接报错，会把成功的构建误判成失败。
+      - name: Save frida cache
+        if: always() && inputs.clean != true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            frida
+            dist-arm64
+          key: frida-${{ env.FRIDA_TAG }}-${{ env.CACHE_VER }}-${{ runner.os }}-${{ github.run_number }}-${{ github.run_attempt }}-${{ job.status }}
 
       # 构建失败时把 meson 日志捞出来，省一次往返。
       - name: Collect logs on failure
